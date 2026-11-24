@@ -1,0 +1,122 @@
+name: Build xaga 5.10.240 test Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Kernel change to build
+        type: choice
+        default: lz4kd
+        options:
+          - lz4kd
+          - teo
+          - lz4kd-teo
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      KERNEL_URL: https://github.com/ztc1997/android_gki_kernel_5.10_common.git
+      KERNEL_REVISION: 6596b957a660d5fafaefe1ff62a1edaab781cecf
+      CLANG_REVISION: 47e1fad3c1d7c647b49597e0ea85c5d8e43a978f
+      VARIANT: ${{ inputs.variant }}
+    steps:
+      - name: Check out the build files
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            bison build-essential cpio device-tree-compiler dwarves flex \
+            kmod libelf-dev libssl-dev lz4 python3 rsync zstd
+          df -h "$RUNNER_TEMP"
+
+      - name: Fetch the source and apply the selected patches
+        run: |
+          kernel="$RUNNER_TEMP/kernel"
+          git init --quiet "$kernel"
+          git -C "$kernel" fetch --depth=1 "$KERNEL_URL" "$KERNEL_REVISION"
+          git -C "$kernel" checkout --quiet --detach FETCH_HEAD
+          git -C "$kernel" submodule update --init --depth=1 -- Baseband-guard
+          case "$VARIANT" in
+            lz4kd) patches=(ztc1997-5.10.240-lz4kd-source.patch) ;;
+            teo) patches=(ztc1997-5.10.240-teo-source.patch) ;;
+            lz4kd-teo)
+              patches=(ztc1997-5.10.240-lz4kd-source.patch ztc1997-5.10.240-teo-source.patch)
+              ;;
+            *)
+              echo "Unknown build variant: $VARIANT" >&2
+              exit 1
+              ;;
+          esac
+          for patch in "${patches[@]}"; do
+            git -C "$kernel" apply --check --whitespace=error-all "$GITHUB_WORKSPACE/patches/$patch"
+            git -C "$kernel" apply --whitespace=error-all "$GITHUB_WORKSPACE/patches/$patch"
+          done
+          git -C "$kernel" diff --check
+
+      - name: Fetch Android Clang 21
+        run: |
+          clang_archive="$RUNNER_TEMP/clang-r574158.tar.gz"
+          clang_dir="$RUNNER_TEMP/android-clang"
+          clang_url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$CLANG_REVISION/clang-r574158.tar.gz"
+          mkdir -p "$clang_dir"
+          curl --fail --location --retry 3 "$clang_url" --output "$clang_archive"
+          tar -xzf "$clang_archive" -C "$clang_dir"
+          rm -f -- "$clang_archive"
+          "$clang_dir/bin/clang" --version | grep -F '14229180'
+          echo "$clang_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Compile the ARM64 Image
+        run: |
+          kernel="$RUNNER_TEMP/kernel"
+          output="$RUNNER_TEMP/kernel-out"
+          make_args=(
+            -C "$kernel" "O=$output" ARCH=arm64 LLVM=1 LLVM_IAS=1
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            BRANCH=android12-5.10 KMI_GENERATION=9
+            KCFLAGS=-D__ANDROID_COMMON_KERNEL__
+          )
+          make "${make_args[@]}" gki_defconfig
+          grep -x 'CONFIG_ARM64_4K_PAGES=y' "$output/.config"
+          grep -x 'CONFIG_KSU=y' "$output/.config"
+          grep -x 'CONFIG_KSU_SUSFS=y' "$output/.config"
+          grep -x 'CONFIG_CPU_IDLE_GOV_TEO=y' "$output/.config"
+          if [[ "$VARIANT" == *lz4kd* ]]; then
+            grep -x 'CONFIG_CRYPTO_LZ4KD=y' "$output/.config"
+          fi
+
+          make "${make_args[@]}" -j"$(nproc)" Image
+          image="$output/arch/arm64/boot/Image"
+          test -s "$image"
+          if [[ "$VARIANT" == *lz4kd* ]]; then
+            strings "$image" | grep -x 'lz4kd-generic'
+          fi
+
+          artifact="$GITHUB_WORKSPACE/build-artifact"
+          mkdir -p "$artifact"
+          cp "$image" "$artifact/Image"
+          cp "$output/.config" "$artifact/kernel.config"
+          cp "$output/include/config/kernel.release" "$artifact/kernel.release"
+          git -C "$kernel" rev-parse HEAD > "$artifact/source-commit.txt"
+          clang --version > "$artifact/toolchain.txt"
+          cd "$artifact"
+          sha256sum Image > SHA256SUMS
+
+      - name: Upload the test Image
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: xaga-5.10.240-${{ inputs.variant }}-test
+          path: build-artifact/
+          if-no-files-found: error
